@@ -136,10 +136,11 @@ func main() {
 							Namespace:    metav1.NamespaceDefault, // The Event itself lives in default
 						},
 						InvolvedObject: corev1.ObjectReference{
-							Kind:      "Node",
-							Name:      nodeName,
-							UID:       uid, // CRITICAL: Link to the specific object ID
-							Namespace: "",  // CRITICAL: Nodes are not namespaced, keep this empty
+							APIVersion: "v1",
+							Kind:       "Node",
+							Name:       nodeName,
+							UID:        uid, // CRITICAL: Link to the specific object ID
+							Namespace:  "",  // CRITICAL: Nodes are not namespaced, keep this empty
 						},
 						Reason:         "KubeletTCPUnreachable",
 						Message:        fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
