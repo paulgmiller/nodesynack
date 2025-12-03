@@ -11,8 +11,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -38,19 +38,6 @@ func pickNodeIP(n *corev1.Node) string {
 		}
 	}
 	return ""
-}
-
-func newEventRecorder(client kubernetes.Interface, component string) record.EventRecorder {
-	broadcaster := record.NewBroadcaster()
-	// Optional but nice:
-	broadcaster.StartStructuredLogging(0)
-	broadcaster.StartRecordingToSink(&corev1client.EventSinkImpl{
-		Interface: client.CoreV1().Events(""), // NOTE: "" namespace for cluster-scoped objects
-	})
-
-	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
-		Component: component,
-	})
 }
 
 // tcpReachable tries to complete a TCP handshake to addr:port up to maxRetries.
@@ -134,15 +121,15 @@ func main() {
 		slog.InfoContext(ctx, "Found nodes", "count", len(nodes.Items))
 		//wait group? or cancel context each loop?
 		for _, n := range nodes.Items {
-			nodeName := n.Name
-			nodeIP := pickNodeIP(&n)
-			if nodeIP == "" {
-				fmt.Fprintf(os.Stderr, "node %s has no usable IP; skipping\n", nodeName)
-				continue
-			}
 
 			//if nodes.Status.Conditions
-			go func(nodeName, nodeIP string, uid types.UID) {
+			go func(node v1.Node) {
+				nodeName := n.Name
+				nodeIP := pickNodeIP(&n)
+				if nodeIP == "" {
+					slog.WarnContext(ctx, "node has no usable IP; skipping", "node", nodeName)
+					return
+				}
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
@@ -151,10 +138,10 @@ func main() {
 						"Kubelet %s (%s:%d) is unreachable from %s",
 						nodeName, nodeIP, port, hostname,
 					)
-					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP)
+					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP, "uid", node.UID)
 				}
 
-			}(nodeName, nodeIP, n.UID)
+			}(n)
 		}
 		select {
 		case <-ctx.Done():
@@ -166,4 +153,17 @@ func main() {
 
 	}
 
+}
+
+func newEventRecorder(client kubernetes.Interface, component string) record.EventRecorder {
+	broadcaster := record.NewBroadcaster()
+	// Optional but nice:
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&corev1client.EventSinkImpl{
+		Interface: client.CoreV1().Events(""), // NOTE: "" namespace for cluster-scoped objects
+	})
+
+	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
+		Component: component,
+	})
 }
