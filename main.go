@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,100 +26,35 @@ const (
 	dialTimeout        = 2 * time.Second
 )
 
-// pickNodeIP chooses the best IP to use to reach the kubelet.
-// Prefers InternalIP, then ExternalIP, then Hostname.
+// pickNodeIP grabs the interal ip.  Extenal ip, or hostname are ignored for now
 func pickNodeIP(n *corev1.Node) string {
-	var internal, external, hostname string
 	for _, a := range n.Status.Addresses {
-		switch a.Type {
-		case corev1.NodeInternalIP:
-			if internal == "" {
-				internal = a.Address
-			}
-		case corev1.NodeExternalIP:
-			if external == "" {
-				external = a.Address
-			}
-		case corev1.NodeHostName:
-			if hostname == "" {
-				hostname = a.Address
-			}
+		if a.Type == corev1.NodeInternalIP {
+			return a.Address
 		}
 	}
-	if internal != "" {
-		return internal
-	}
-	if external != "" {
-		return external
-	}
-	return hostname
+	return ""
 }
 
 // tcpReachable tries to complete a TCP handshake to addr:port up to maxRetries.
 // This is effectively "send SYN, expect SYN-ACK" in terms of reachability.
-func tcpReachable(addr string, port int, retries int, timeout time.Duration) bool {
+// Doing this to keep
+func tcpReachable(ctx context.Context, addr string, port int, retries int) bool {
 	target := fmt.Sprintf("%s:%d", addr, port)
-	dialer := net.Dialer{
-		Timeout: timeout,
-	}
+	dialer := net.Dialer{}
 
-	for i := 0; i < retries; i++ {
-		conn, err := dialer.Dial("tcp", target)
+	//use
+	for range retries {
+		conn, err := dialer.DialContext(ctx, "tcp", target)
 		if err == nil {
 			_ = conn.Close()
 			return true
 		}
-		// small delay between retries
+		//pass in node name for better logging?
+		// small delay betwee`n retries
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false
-}
-
-// upsertCondition updates or inserts the custom condition on the Node.
-func upsertCondition(node *corev1.Node, reachable bool) bool {
-	now := metav1.NewTime(time.Now())
-
-	status := corev1.ConditionFalse
-	reason := "KubeletTCPDialFailed"
-	message := "Failed to TCP connect to kubelet port"
-	if reachable {
-		status = corev1.ConditionTrue
-		reason = "KubeletTCPDialSucceeded"
-		message = "Successfully TCP connected to kubelet port"
-	}
-
-	newCond := corev1.NodeCondition{
-		Type:               ConditionTypeKubeletTCPReachable,
-		Status:             status,
-		LastHeartbeatTime:  now,
-		LastTransitionTime: now,
-		Reason:             reason,
-		Message:            message,
-	}
-
-	conds := node.Status.Conditions
-	for i := range conds {
-		if conds[i].Type == ConditionTypeKubeletTCPReachable {
-			// If nothing changed except heartbeat, just update heartbeat/transition appropriately.
-			if conds[i].Status == newCond.Status &&
-				conds[i].Reason == newCond.Reason &&
-				conds[i].Message == newCond.Message {
-				conds[i].LastHeartbeatTime = now
-				// LastTransitionTime unchanged if status didn't change.
-				node.Status.Conditions = conds
-				return true
-			}
-
-			// Status or meaning changed – update everything and bump transition time.
-			newCond.LastTransitionTime = now
-			node.Status.Conditions[i] = newCond
-			return true
-		}
-	}
-
-	// Condition not present – append it.
-	node.Status.Conditions = append(node.Status.Conditions, newCond)
-	return true
 }
 
 func buildKubeClient(kubeconfig string) (*kubernetes.Clientset, error) {
@@ -150,64 +87,64 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
-	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to list nodes: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to get hostname: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Found %d nodes\n", len(nodes.Items))
-
-	for _, n := range nodes.Items {
-		nodeName := n.Name
-		nodeIP := pickNodeIP(&n)
-		if nodeIP == "" {
-			fmt.Fprintf(os.Stderr, "node %s has no usable IP; skipping\n", nodeName)
-			continue
-		}
-
-		fmt.Printf("Probing node %s (%s)...\n", nodeName, nodeIP)
-		reachable := tcpReachable(nodeIP, *port, *retries, time.Duration(*timeoutSec)*time.Second)
-		fmt.Printf("  reachable=%v\n", reachable)
-
-		// Get fresh copy & update status subresource
-		latest, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	for {
+		//TODO watch instead and and remove from running go routines?
+		//filter out un ready
+		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to get node %s: %v\n", nodeName, err)
-			continue
+			fmt.Fprintf(os.Stderr, "failed to list nodes: %v\n", err)
+			os.Exit(1)
 		}
 
-		// Work on a deep copy / modify status
-		updated := latest.DeepCopy()
-		changed := upsertCondition(updated, reachable)
-		if !changed {
-			continue
+		fmt.Printf("Found %d nodes\n", len(nodes.Items))
+		//wait group?
+		for _, n := range nodes.Items {
+			nodeName := n.Name
+			nodeIP := pickNodeIP(&n)
+			if nodeIP == "" {
+				fmt.Fprintf(os.Stderr, "node %s has no usable IP; skipping\n", nodeName)
+				continue
+			}
+
+			//if nodes.Status.Conditions
+			go func(nodeName, nodeIP string) {
+				ctx, cancel := context.WithTimeout(ctx, time.Duration(*timeoutSec)*time.Second)
+				defer cancel()
+				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
+				if !reachable {
+					_, err = client.CoreV1().Events("").Create(ctx, &corev1.Event{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
+						},
+						InvolvedObject: corev1.ObjectReference{
+							Kind:      "Node",
+							Name:      nodeName,
+							Namespace: "",
+						},
+						Reason:  "KubeletTCPUnreachable",
+						Message: fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
+					}, metav1.CreateOptions{})
+					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP)
+				}
+
+			}(nodeName, nodeIP)
+		}
+		select {
+		case <-ctx.Done():
+			fmt.Println("Shutting down...")
+			return
+		case <-time.After(time.Duration(*timeoutSec) * 5 * time.Second): //make configurable
+			// continue the loop
 		}
 
-		// Use UpdateStatus to avoid racing spec updates
-		_, err = client.CoreV1().Nodes().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to update status for node %s: %v\n", nodeName, err)
-
-			// Optional: fall back to a strategic merge patch if your cluster is picky:
-			// _ = patchNodeCondition(ctx, client, latest, updated)
-			continue
-		}
-
-		fmt.Printf("  updated condition %q on node %s\n", ConditionTypeKubeletTCPReachable, nodeName)
 	}
 
-	fmt.Println("Done.")
 }
-
-// Optional: if you want to patch instead of UpdateStatus, you could implement something like this:
-//
-// func patchNodeCondition(ctx context.Context, client *kubernetes.Clientset, old, new *corev1.Node) error {
-//     // Build a minimal status patch here if UpdateStatus is blocked by RBAC / admission,
-//     // using e.g. strategic merge patch on status.conditions.
-//     // Left as an exercise since it's cluster-policy-dependent.
-//     return nil
-// }
-//
-// You'd call it from main if UpdateStatus fails with a known conflict you care about.
