@@ -99,7 +99,8 @@ func main() {
 		slog.ErrorContext(ctx, "failed to build kube client", "error", err)
 		os.Exit(1)
 	}
-	recorder := newEventRecorder(client, "nodesynack")
+	//use per loop context?s
+	recorder := newEventRecorder(ctx, client, "nodesynack")
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -155,13 +156,13 @@ func main() {
 
 }
 
-func newEventRecorder(client kubernetes.Interface, component string) record.EventRecorder {
-	broadcaster := record.NewBroadcaster()
+func newEventRecorder(ctx context.Context, client kubernetes.Interface, component string) record.EventRecorder {
+	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	// Optional but nice:
 	broadcaster.StartStructuredLogging(0)
-	broadcaster.StartRecordingToSink(&corev1client.EventSinkImpl{
-		Interface: client.CoreV1().Events(""), // NOTE: "" namespace for cluster-scoped objects
-	})
+	sink := &corev1client.EventSinkImpl{Interface: corev1client.New(client.CoreV1().RESTClient()).Events("")}
+	broadcaster.StartLogging(slog.Info)
+	broadcaster.StartRecordingToSink(sink)
 
 	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
 		Component: component,
