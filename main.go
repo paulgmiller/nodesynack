@@ -45,14 +45,20 @@ func tcpReachable(ctx context.Context, addr string, port int, retries int) bool 
 
 	//use
 	for range retries {
-		conn, err := dialer.DialContext(ctx, "tcp", target)
+		dialctx, cancel := context.WithTimeout(ctx, dialTimeout)
+		conn, err := dialer.DialContext(dialctx, "tcp", target)
+		cancel()
 		if err == nil {
 			_ = conn.Close()
 			return true
 		}
 		//pass in node name for better logging?
 		// small delay betwee`n retries
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 	return false
 }
@@ -74,10 +80,10 @@ func buildKubeClient(kubeconfig string) (*kubernetes.Clientset, error) {
 
 func main() {
 	var (
-		kubeconfig = flag.String("kubeconfig", "", "Path to kubeconfig (if empty, use in-cluster config)")
-		port       = flag.Int("port", defaultKubeletPort, "Kubelet TCP port to probe")
-		retries    = flag.Int("retries", maxRetries, "Number of TCP dial retries")
-		timeoutSec = flag.Int("timeout-seconds", int(dialTimeout.Seconds()), "Per-dial timeout in seconds")
+		kubeconfig     = flag.String("kubeconfig", "", "Path to kubeconfig (if empty, use in-cluster config)")
+		port           = flag.Int("port", defaultKubeletPort, "Kubelet TCP port to probe")
+		retries        = flag.Int("retries", maxRetries, "Number of TCP dial retries")
+		loopTimeoutSec = flag.Int("timeout-seconds", int(dialTimeout.Seconds()*5), "Per loop timeout in seconds")
 	)
 	flag.Parse()
 
@@ -99,6 +105,8 @@ func main() {
 	for {
 		//TODO watch instead and and remove from running go routines?
 		//filter out un ready
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
 		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to list nodes", "error", err)
@@ -106,7 +114,7 @@ func main() {
 		}
 
 		slog.InfoContext(ctx, "Found nodes", "count", len(nodes.Items))
-		//wait group?
+		//wait group? or cancel context each loop?
 		for _, n := range nodes.Items {
 			nodeName := n.Name
 			nodeIP := pickNodeIP(&n)
@@ -117,11 +125,10 @@ func main() {
 
 			//if nodes.Status.Conditions
 			go func(nodeName, nodeIP string) {
-				ctx, cancel := context.WithTimeout(ctx, time.Duration(*timeoutSec)*time.Second)
-				defer cancel()
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
+
 				if !reachable {
-					_, err = client.CoreV1().Events("").Create(ctx, &corev1.Event{
+					_, err = client.CoreV1().Events("kube-system").Create(ctx, &corev1.Event{
 						ObjectMeta: metav1.ObjectMeta{
 							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
 						},
@@ -145,7 +152,7 @@ func main() {
 		case <-ctx.Done():
 			fmt.Println("Shutting down...")
 			return
-		case <-time.After(time.Duration(*timeoutSec) * 5 * time.Second): //make configurable
+		case <-time.After(time.Duration(*loopTimeoutSec) * time.Second):
 			// continue the loop
 		}
 
