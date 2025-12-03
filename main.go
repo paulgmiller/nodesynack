@@ -136,7 +136,7 @@ func main() {
 						InvolvedObject: corev1.ObjectReference{
 							Kind:      "Node",
 							Name:      nodeName,
-							Namespace: metav1.NamespaceDefault,
+							Namespace: "",
 						},
 						Reason:  "KubeletTCPUnreachable",
 						Message: fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
