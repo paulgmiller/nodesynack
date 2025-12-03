@@ -128,7 +128,7 @@ func main() {
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
-					_, err = client.CoreV1().Events("").Create(ctx, &corev1.Event{
+					_, err = client.CoreV1().Events(metav1.NamespaceDefault).Create(ctx, &corev1.Event{
 						ObjectMeta: metav1.ObjectMeta{
 							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
 							Namespace:    metav1.NamespaceDefault,
