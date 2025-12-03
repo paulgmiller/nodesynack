@@ -128,14 +128,15 @@ func main() {
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
-					_, err = client.CoreV1().Events("kube-system").Create(ctx, &corev1.Event{
+					_, err = client.CoreV1().Events(metav1.NamespaceSystem).Create(ctx, &corev1.Event{
 						ObjectMeta: metav1.ObjectMeta{
 							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
+							Namespace:    metav1.NamespaceSystem,
 						},
 						InvolvedObject: corev1.ObjectReference{
 							Kind:      "Node",
 							Name:      nodeName,
-							Namespace: "",
+							Namespace: metav1.NamespaceSystem,
 						},
 						Reason:  "KubeletTCPUnreachable",
 						Message: fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
