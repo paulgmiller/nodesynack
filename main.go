@@ -81,17 +81,18 @@ func main() {
 	)
 	flag.Parse()
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
 	client, err := buildKubeClient(*kubeconfig)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build kube client: %v\n", err)
+		slog.ErrorContext(ctx, "failed to build kube client", "error", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
-	defer cancel()
 	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get hostname: %v\n", err)
+		slog.ErrorContext(ctx, "failed to get hostname", "error", err)
 		os.Exit(1)
 	}
 
@@ -100,11 +101,11 @@ func main() {
 		//filter out un ready
 		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to list nodes: %v\n", err)
-			os.Exit(1)
+			slog.ErrorContext(ctx, "failed to list nodes", "error", err)
+			os.Exit(1) //should we crash or just contiue?
 		}
 
-		fmt.Printf("Found %d nodes\n", len(nodes.Items))
+		slog.InfoContext(ctx, "Found nodes", "count", len(nodes.Items))
 		//wait group?
 		for _, n := range nodes.Items {
 			nodeName := n.Name
@@ -133,6 +134,9 @@ func main() {
 						Message: fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
 					}, metav1.CreateOptions{})
 					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP)
+				}
+				if err != nil {
+					slog.ErrorContext(ctx, "failed to create event", "node", nodeName, "error", err)
 				}
 
 			}(nodeName, nodeIP)
