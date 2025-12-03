@@ -14,8 +14,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 )
 
 // Condition type we'll set on the Node
@@ -35,6 +38,19 @@ func pickNodeIP(n *corev1.Node) string {
 		}
 	}
 	return ""
+}
+
+func newEventRecorder(client kubernetes.Interface, component string) record.EventRecorder {
+	broadcaster := record.NewBroadcaster()
+	// Optional but nice:
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&corev1client.EventSinkImpl{
+		Interface: client.CoreV1().Events(""), // NOTE: "" namespace for cluster-scoped objects
+	})
+
+	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
+		Component: component,
+	})
 }
 
 // tcpReachable tries to complete a TCP handshake to addr:port up to maxRetries.
@@ -96,6 +112,7 @@ func main() {
 		slog.ErrorContext(ctx, "failed to build kube client", "error", err)
 		os.Exit(1)
 	}
+	recorder := newEventRecorder(client, "nodesynack")
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -129,34 +146,12 @@ func main() {
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
-					t := metav1.Time{Time: time.Now()}
-					_, err = client.CoreV1().Events(metav1.NamespaceDefault).Create(ctx, &corev1.Event{
-						ObjectMeta: metav1.ObjectMeta{
-							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
-							Namespace:    metav1.NamespaceDefault, // The Event itself lives in default
-						},
-						InvolvedObject: corev1.ObjectReference{
-							APIVersion: "v1",
-							Kind:       "Node",
-							Name:       nodeName,
-							UID:        uid, // CRITICAL: Link to the specific object ID
-							Namespace:  "",  // CRITICAL: Nodes are not namespaced, keep this empty
-						},
-						Reason:         "KubeletTCPUnreachable",
-						Message:        fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
-						Type:           corev1.EventTypeWarning, // Usually 'Warning' or 'Normal'
-						FirstTimestamp: t,                       // CRITICAL: Required for display
-						LastTimestamp:  t,                       // CRITICAL: Required for display
-						Count:          1,
-						Source: corev1.EventSource{
-							Component: "nodesynack",
-							Host:      hostname,
-						},
-					}, metav1.CreateOptions{})
+					recorder.Eventf(&n, corev1.EventTypeWarning, // or corev1.EventTypeNormal
+						"KubeletTCPUnreachable", // reason
+						"Kubelet %s (%s:%d) is unreachable from %s",
+						nodeName, nodeIP, port, hostname,
+					)
 					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP)
-				}
-				if err != nil {
-					slog.ErrorContext(ctx, "failed to create event", "node", nodeName, "error", err)
 				}
 
 			}(nodeName, nodeIP, n.UID)
