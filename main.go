@@ -12,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -124,22 +125,32 @@ func main() {
 			}
 
 			//if nodes.Status.Conditions
-			go func(nodeName, nodeIP string) {
+			go func(nodeName, nodeIP string, uid types.UID) {
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
+					t := metav1.Time{Time: time.Now()}
 					_, err = client.CoreV1().Events(metav1.NamespaceDefault).Create(ctx, &corev1.Event{
 						ObjectMeta: metav1.ObjectMeta{
 							GenerateName: fmt.Sprintf("%s-kubelet-tcp-unreachable-", nodeName),
-							Namespace:    metav1.NamespaceDefault,
+							Namespace:    metav1.NamespaceDefault, // The Event itself lives in default
 						},
 						InvolvedObject: corev1.ObjectReference{
 							Kind:      "Node",
 							Name:      nodeName,
-							Namespace: "",
+							UID:       uid, // CRITICAL: Link to the specific object ID
+							Namespace: "",  // CRITICAL: Nodes are not namespaced, keep this empty
 						},
-						Reason:  "KubeletTCPUnreachable",
-						Message: fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
+						Reason:         "KubeletTCPUnreachable",
+						Message:        fmt.Sprintf("Kubelet %s (%s:%d) is unreachable from %s", nodeName, nodeIP, *port, hostname),
+						Type:           corev1.EventTypeWarning, // Usually 'Warning' or 'Normal'
+						FirstTimestamp: t,                       // CRITICAL: Required for display
+						LastTimestamp:  t,                       // CRITICAL: Required for display
+						Count:          1,
+						Source: corev1.EventSource{
+							Component: "nodesynack",
+							Host:      hostname,
+						},
 					}, metav1.CreateOptions{})
 					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP)
 				}
@@ -147,7 +158,7 @@ func main() {
 					slog.ErrorContext(ctx, "failed to create event", "node", nodeName, "error", err)
 				}
 
-			}(nodeName, nodeIP)
+			}(nodeName, nodeIP, n.UID)
 		}
 		select {
 		case <-ctx.Done():
