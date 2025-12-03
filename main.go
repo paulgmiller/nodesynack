@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -134,7 +135,7 @@ func main() {
 				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
 
 				if !reachable {
-					recorder.Eventf(&n, corev1.EventTypeWarning, // or corev1.EventTypeNormal
+					recorder.Eventf(createEventNodeRef(n.Name), corev1.EventTypeWarning, // or corev1.EventTypeNormal
 						"KubeletTCPUnreachable", // reason
 						"Kubelet %s (%s:%d) is unreachable from %s",
 						nodeName, nodeIP, port, hostname,
@@ -167,4 +168,22 @@ func newEventRecorder(ctx context.Context, client kubernetes.Interface, componen
 	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
 		Component: component,
 	})
+}
+
+// CreateEventNodeRef creates an ObjectReference to a Node to be used as the
+// target in an Event.
+// This is required because the Node Event references must have the UID of the
+// ObjectRef set to the name of the Node, *NOT* the UID of the Node Object, so
+// that the Events show up in the Event stream of the Node correctly.
+// (like when executing a `kubectl describe <node>`)
+// Letting the EventRecorder machinery build the ObjectRef automatically
+// sets the Node Qbject's actual UID which does not correctly associate the
+// Event to the Node.
+func createEventNodeRef(nodeName string) *v1.ObjectReference {
+	return &v1.ObjectReference{
+		Kind:      "Node",
+		Name:      string(nodeName),
+		UID:       types.UID(nodeName), // not a UID, but that's how it works
+		Namespace: "",
+	}
 }
