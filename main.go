@@ -24,11 +24,10 @@ import (
 
 // Condition type we'll set on the Node
 const (
-	ConditionTypeKubeletTCPReachable corev1.NodeConditionType = "KubeletTCPReachable"
-
 	defaultKubeletPort = 10250
 	maxRetries         = 5
 	dialTimeout        = 2 * time.Second
+	reason             = "KubeletTCPUnreachable"
 )
 
 // pickNodeIP grabs the interal ip.  Extenal ip, or hostname are ignored for now
@@ -72,8 +71,6 @@ func buildKubeClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-const reason = "KubeletTCPUnreachable"
-
 func watchEvents(ctx context.Context, client kubernetes.Interface, port int) {
 	const retryDelay = 5 * time.Second
 
@@ -92,9 +89,7 @@ func watchEvents(ctx context.Context, client kubernetes.Interface, port int) {
 		select {
 		case <-ctx.Done():
 		case <-time.After(retryDelay):
-			slog.WarnContext(ctx, "event watch stream ended, restarting in", "delay", retryDelay)
 		}
-
 	}
 }
 
@@ -131,12 +126,33 @@ func processEventStream(ctx context.Context, client kubernetes.Interface, port i
 				continue
 			}
 
+			log := slog.With("node", k8sEvent.InvolvedObject.Name)
+
 			// Check if the node mentioned in the event is actually reachable from our perspective
+			// using dns should we do  a node loop up instead? or stick ip on event
 			if tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port) {
-				slog.InfoContext(ctx, "node reported unreachable but is reachable from here",
-					"node", k8sEvent.InvolvedObject.Name,
+				log.InfoContext(ctx, "node reported unreachable but is reachable from here",
 					"reporting_host", k8sEvent.Source.Host)
+				return
 			}
+			if _, nocordon := os.LookupEnv("NO_CORDON"); nocordon {
+				continue
+			}
+
+			n, err := client.CoreV1().Nodes().Get(ctx, k8sEvent.InvolvedObject.Name, metav1.GetOptions{})
+			if err != nil {
+				log.ErrorContext(ctx, "failed to get node", "err", err)
+				continue
+			}
+			n.Spec.Unschedulable = true
+			n.Annotations["nodesynack/cordoned-by"] = hostname
+			_, err = client.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
+			if err != nil {
+				log.ErrorContext(ctx, "failed to cordon node", "error", err)
+				continue
+			}
+			//do we want to do aa curtosy eviction?
+			log.InfoContext(ctx, "cordoned node as it is unreachable from this host")
 		}
 	}
 }
@@ -241,9 +257,7 @@ func main() {
 
 func newEventRecorder(ctx context.Context, client kubernetes.Interface, component string) record.EventRecorder {
 	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
-	// Optional but nice:
-	broadcaster.StartStructuredLogging(0)
-	sink := &corev1client.EventSinkImpl{Interface: corev1client.New(client.CoreV1().RESTClient()).Events("")}
+	sink := &corev1client.EventSinkImpl{Interface: client.CoreV1().Events("")}
 	broadcaster.StartLogging(slog.Info)
 	broadcaster.StartRecordingToSink(sink)
 
