@@ -43,27 +43,16 @@ func pickNodeIP(n *corev1.Node) string {
 
 // tcpReachable tries to complete a TCP handshake to addr:port up to maxRetries.
 // This is effectively "send SYN, expect SYN-ACK" in terms of reachability.
-// Doing this to keep
-func tcpReachable(ctx context.Context, addr string, port int, retries int) bool {
+// It desn't retry because tcp itslf already retries but it does timeout after constant
+func tcpReachable(ctx context.Context, addr string, port int) bool {
 	target := fmt.Sprintf("%s:%d", addr, port)
 	dialer := net.Dialer{}
-
-	//use
-	for range retries {
-		dialctx, cancel := context.WithTimeout(ctx, dialTimeout)
-		conn, err := dialer.DialContext(dialctx, "tcp", target)
-		cancel()
-		if err == nil {
-			_ = conn.Close()
-			return true
-		}
-		//pass in node name for better logging?
-		// small delay betwee`n retries
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(200 * time.Millisecond):
-		}
+	dialctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	conn, err := dialer.DialContext(dialctx, "tcp", target)
+	cancel()
+	if err == nil {
+		_ = conn.Close()
+		return true
 	}
 	return false
 }
@@ -83,37 +72,56 @@ func buildKubeClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-func main() {
-	var (
-		kubeconfig     = flag.String("kubeconfig", "", "Path to kubeconfig (if empty, use in-cluster config)")
-		port           = flag.Int("port", defaultKubeletPort, "Kubelet TCP port to probe")
-		retries        = flag.Int("retries", maxRetries, "Number of TCP dial retries")
-		loopTimeoutSec = flag.Int("timeout-seconds", int(dialTimeout.Seconds()*5), "Per loop timeout in seconds")
-	)
-	flag.Parse()
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
-	defer cancel()
-
-	client, err := buildKubeClient(*kubeconfig)
+func watchEvents(ctx context.Context, client kubernetes.Interface, port int) {
+	// Use field selector to filter for KubeletTCPUnreachable events server-side
+	watcher, err := client.CoreV1().Events("").Watch(ctx, metav1.ListOptions{
+		FieldSelector: "reason=KubeletTCPUnreachable",
+	})
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to build kube client", "error", err)
+		slog.ErrorContext(ctx, "failed to start watching events", "error", err)
 		os.Exit(1)
 	}
+	defer watcher.Stop()
+
+	slog.InfoContext(ctx, "Started watching events for KubeletTCPUnreachable from other hosts")
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Shutting down...")
+			return
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				slog.WarnContext(ctx, "watch channel closed, restarting watch")
+				return
+			}
+
+			k8sEvent, ok := event.Object.(*corev1.Event)
+			if !ok {
+				slog.WarnContext(ctx, "unexpected object type in watch event")
+				continue
+			}
+
+			if k8sEvent.Source.Host == hostname {
+				continue
+			}
+
+			tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port) {
+				return
+			}
+		}
+	}
+}
+
+func synloop(ctx context.Context, client kubernetes.Interface, port int, interval time.Duration) {
 	//use per loop context?s
 	recorder := newEventRecorder(ctx, client, "nodesynack")
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to get hostname", "error", err)
-		os.Exit(1)
-	}
-
 	for {
 		//TODO watch instead and and remove from running go routines?
 		//filter out un ready
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
+
 		nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to list nodes", "error", err)
@@ -124,7 +132,24 @@ func main() {
 		//wait group? or cancel context each loop?
 		for _, n := range nodes.Items {
 
-			//if nodes.Status.Conditions
+			// Check if node is schedulable (not cordoned)
+			if n.Spec.Unschedulable {
+				continue
+			}
+
+			// Check if node is ready
+			isReady := false
+			for _, condition := range n.Status.Conditions {
+				if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+
+			if !isReady {
+				continue
+			}
+
 			go func(node v1.Node) {
 				nodeName := n.Name
 				nodeIP := pickNodeIP(&n)
@@ -132,7 +157,7 @@ func main() {
 					slog.WarnContext(ctx, "node has no usable IP; skipping", "node", nodeName)
 					return
 				}
-				reachable := tcpReachable(ctx, nodeIP, *port, *retries)
+				reachable := tcpReachable(ctx, nodeIP, port)
 
 				if !reachable {
 					recorder.Eventf(createEventNodeRef(n.Name), corev1.EventTypeWarning, // or corev1.EventTypeNormal
@@ -149,11 +174,38 @@ func main() {
 		case <-ctx.Done():
 			fmt.Println("Shutting down...")
 			return
-		case <-time.After(time.Duration(*loopTimeoutSec) * time.Second):
+		case <-time.After(interval):
 			// continue the loop
 		}
-
 	}
+}
+
+var hostname string //global!!!
+
+func main() {
+	var (
+		kubeconfig     = flag.String("kubeconfig", "", "Path to kubeconfig (if empty, use in-cluster config)")
+		port           = flag.Int("port", defaultKubeletPort, "Kubelet TCP port to probe")
+		loopTimeoutSec = flag.Int("timeout-seconds", int(dialTimeout.Seconds()*5), "Per loop timeout in seconds")
+	)
+	flag.Parse()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
+	client, err := buildKubeClient(*kubeconfig)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to build kube client", "error", err)
+		os.Exit(1)
+	}
+
+	hostname, err = os.Hostname()
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to get hostname", "error", err)
+		os.Exit(1)
+	}
+
+	synloop(ctx, client, *port, time.Duration(*loopTimeoutSec)*time.Second)
 
 }
 
@@ -167,6 +219,7 @@ func newEventRecorder(ctx context.Context, client kubernetes.Interface, componen
 
 	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
 		Component: component,
+		Host:      hostname,
 	})
 }
 
