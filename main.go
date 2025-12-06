@@ -25,7 +25,6 @@ import (
 // Condition type we'll set on the Node
 const (
 	defaultKubeletPort = 10250
-	maxRetries         = 5
 	dialTimeout        = 2 * time.Second
 	reason             = "KubeletTCPUnreachable"
 )
