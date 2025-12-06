@@ -72,27 +72,51 @@ func buildKubeClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
+const reason = "KubeletTCPUnreachable"
+
 func watchEvents(ctx context.Context, client kubernetes.Interface, port int) {
-	// Use field selector to filter for KubeletTCPUnreachable events server-side
+	const retryDelay = 5 * time.Second
+
+	for {
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "Shutting down event watcher...")
+			return
+		}
+
+		// Reset retry delay on successful connection
+		slog.InfoContext(ctx, "Watching events for "+reason+" from other hosts")
+
+		// Process events from this watcher
+		processEventStream(ctx, client, port)
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(retryDelay):
+			slog.WarnContext(ctx, "event watch stream ended, restarting in", "delay", retryDelay)
+		}
+
+	}
+}
+
+// processEventStream handles the event stream from a single watcher
+// Returns false if the stream should be restarted, true if context was cancelled
+func processEventStream(ctx context.Context, client kubernetes.Interface, port int) {
+	// Create watcher with retry logic
 	watcher, err := client.CoreV1().Events("").Watch(ctx, metav1.ListOptions{
-		FieldSelector: "reason=KubeletTCPUnreachable",
+		FieldSelector: "reason=" + reason,
 	})
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to start watching events", "error", err)
-		os.Exit(1)
+		slog.ErrorContext(ctx, "failed to start watching events, retrying", "error", err)
+		return
 	}
 	defer watcher.Stop()
-
-	slog.InfoContext(ctx, "Started watching events for KubeletTCPUnreachable from other hosts")
-
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Shutting down...")
 			return
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
-				slog.WarnContext(ctx, "watch channel closed, restarting watch")
+				slog.WarnContext(ctx, "watch channel closed")
 				return
 			}
 
@@ -102,12 +126,16 @@ func watchEvents(ctx context.Context, client kubernetes.Interface, port int) {
 				continue
 			}
 
+			// Skip events from our own host
 			if k8sEvent.Source.Host == hostname {
 				continue
 			}
 
-			tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port) {
-				return
+			// Check if the node mentioned in the event is actually reachable from our perspective
+			if tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port) {
+				slog.InfoContext(ctx, "node reported unreachable but is reachable from here",
+					"node", k8sEvent.InvolvedObject.Name,
+					"reporting_host", k8sEvent.Source.Host)
 			}
 		}
 	}
@@ -161,8 +189,8 @@ func synloop(ctx context.Context, client kubernetes.Interface, port int, interva
 
 				if !reachable {
 					recorder.Eventf(createEventNodeRef(n.Name), corev1.EventTypeWarning, // or corev1.EventTypeNormal
-						"KubeletTCPUnreachable", // reason
-						"Kubelet %s (%s:%d) is unreachable from %s",
+						reason,
+						"%s (%s:%d) is unreachable from %s",
 						nodeName, nodeIP, port, hostname,
 					)
 					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP, "uid", node.UID)
@@ -205,6 +233,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Run both the active probing loop and event watching concurrently
+	go watchEvents(ctx, client, *port)
 	synloop(ctx, client, *port, time.Duration(*loopTimeoutSec)*time.Second)
 
 }
