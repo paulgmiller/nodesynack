@@ -11,14 +11,14 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "update"]
 - apiGroups: [""]
   resources: ["events"]
-  verbs: ["create", "patch", "update"]
+  verbs: ["create", "patch", "update", "watch"]
 # Optional but nice: new events.k8s.io API
 - apiGroups: ["events.k8s.io"]
   resources: ["events"]
-  verbs: ["create", "patch", "update"]
+  verbs: ["create", "patch", "update", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -44,6 +44,7 @@ spec:
   selector:
     matchLabels:
       app: nodesynack
+  replicas: 3
   template:
     metadata:
       labels:
@@ -53,12 +54,12 @@ spec:
       serviceAccountName: nodesynack
       containers:
       - name: nodesynack
-        image: paulgmiller/nodesynack:a431979 
+        image: paulgmiller/nodesynack:3453695 
         imagePullPolicy: IfNotPresent
         resources:
           limits:
             cpu: 100m
             memory: 128Mi
           requests:
-            cpu: 50m
-            memory: 64Mi
+            cpu: 100m
+            memory: 128Mi

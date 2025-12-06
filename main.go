@@ -171,7 +171,7 @@ func synloop(ctx context.Context, client kubernetes.Interface, port int, interva
 			os.Exit(1) //should we crash or just contiue?
 		}
 
-		slog.InfoContext(ctx, "Found nodes", "count", len(nodes.Items))
+		//slog.InfoContext(ctx, "Found nodes", "count", len(nodes.Items))
 		//wait group? or cancel context each loop?
 		for _, n := range nodes.Items {
 
@@ -204,9 +204,7 @@ func synloop(ctx context.Context, client kubernetes.Interface, port int, interva
 
 				if !reachable {
 					recorder.Eventf(createEventNodeRef(n.Name), corev1.EventTypeWarning, // or corev1.EventTypeNormal
-						reason,
-						"%s (%s:%d) is unreachable from %s",
-						nodeName, nodeIP, port, hostname,
+						reason, "%s (%s:%d) is unreachable from %s", nodeName, nodeIP, port, hostname,
 					)
 					slog.ErrorContext(ctx, "unreachable", "node", nodeName, "ip", nodeIP, "uid", node.UID)
 				}
@@ -229,7 +227,7 @@ func main() {
 	var (
 		kubeconfig     = flag.String("kubeconfig", "", "Path to kubeconfig (if empty, use in-cluster config)")
 		port           = flag.Int("port", defaultKubeletPort, "Kubelet TCP port to probe")
-		loopTimeoutSec = flag.Int("timeout-seconds", int(dialTimeout.Seconds()*5), "Per loop timeout in seconds")
+		loopTimeoutSec = flag.Int("loop-timeout", int(dialTimeout.Seconds()*10), "Per loop timeout in seconds")
 	)
 	flag.Parse()
 
@@ -257,7 +255,7 @@ func main() {
 func newEventRecorder(ctx context.Context, client kubernetes.Interface, component string) record.EventRecorder {
 	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	sink := &corev1client.EventSinkImpl{Interface: client.CoreV1().Events("")}
-	broadcaster.StartLogging(slog.Info)
+	//broadcaster.StartLogging(slog.Info)
 	broadcaster.StartRecordingToSink(sink)
 
 	return broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
