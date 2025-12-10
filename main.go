@@ -8,8 +8,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +41,14 @@ func pickNodeIP(n *corev1.Node) string {
 	}
 	return ""
 }
+
+var synack = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "nodesynack_synack_events_total",
+		Help: "Total number of SYN-ACK events recorded",
+	},
+	[]string{"node", "success"},
+)
 
 // tcpReachable tries to complete a TCP handshake to addr:port up to maxRetries.
 // This is effectively "send SYN, expect SYN-ACK" in terms of reachability.
@@ -129,7 +140,9 @@ func processEventStream(ctx context.Context, client kubernetes.Interface, port i
 
 			// Check if the node mentioned in the event is actually reachable from our perspective
 			// using dns should we do  a node loop up instead? or stick ip on event
-			if tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port) {
+			reachable := tcpReachable(ctx, k8sEvent.InvolvedObject.Name, port)
+			synack.WithLabelValues(k8sEvent.InvolvedObject.Name, strconv.FormatBool(reachable)).Inc()
+			if reachable {
 				log.InfoContext(ctx, "node reported unreachable but is reachable from here",
 					"reporting_host", k8sEvent.Source.Host)
 				return
@@ -201,6 +214,7 @@ func synloop(ctx context.Context, client kubernetes.Interface, port int, interva
 					return
 				}
 				reachable := tcpReachable(ctx, nodeIP, port)
+				synack.WithLabelValues(nodeName, strconv.FormatBool(reachable)).Inc()
 
 				if !reachable {
 					recorder.Eventf(createEventNodeRef(n.Name), corev1.EventTypeWarning, // or corev1.EventTypeNormal
@@ -248,6 +262,7 @@ func main() {
 
 	// Run both the active probing loop and event watching concurrently
 	go watchEvents(ctx, client, *port)
+	go flusthCounters(ctx, "/var/lib/node_exporter/textfile_collector/pingmesh.prom")
 	synloop(ctx, client, *port, time.Duration(*loopTimeoutSec)*time.Second)
 
 }

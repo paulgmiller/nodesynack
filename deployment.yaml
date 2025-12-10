@@ -52,10 +52,19 @@ spec:
     spec:
       hostNetwork: true
       serviceAccountName: nodesynack
+      volumes:
+      - name: metrics
+        hostPath:
+          path: /var/lib/node_exporter/textfile_collector
+          type: DirectoryOrCreate
       containers:
       - name: nodesynack
-        image: paulgmiller/nodesynack:3453695 
+        image: paulgmiller/nodesynack:3453695
         imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: metrics
+          mountPath: /metrics
+          readOnly: false
         resources:
           limits:
             cpu: 100m
